@@ -71,6 +71,7 @@ const spotifyCallback = z.object({ code: z.string(), state: z.string() });
 router.get("/spotify/callback", withGlobalPreferences, async (req, res) => {
   const { query, globalPreferences } = req as GlobalPreferencesRequest;
   const { code, state } = validate(query, spotifyCallback);
+  let redirectUrl = get("CLIENT_ENDPOINT");
 
   try {
     const cookie = spotifyCallbackOAuthCookie.parse(
@@ -92,41 +93,41 @@ router.get("/spotify/callback", withGlobalPreferences, async (req, res) => {
     let user = await getUserFromField("spotifyId", spotifyMe.id, false);
     if (!user) {
       if (!globalPreferences.allowRegistrations) {
-        return res.redirect(`${get("CLIENT_ENDPOINT")}/registrations-disabled`);
+        redirectUrl = `${get("CLIENT_ENDPOINT")}/registrations-disabled`;
+      } else {
+        const nbUsers = await getUserCount();
+        user = await createUser(
+          spotifyMe.display_name,
+          spotifyMe.id,
+          nbUsers === 0,
+        );
       }
-      const nbUsers = await getUserCount();
-      user = await createUser(
-        spotifyMe.display_name,
-        spotifyMe.id,
-        nbUsers === 0,
+    }
+    if (user) {
+      await storeInUser("_id", user._id, infos);
+      const privateData = await getPrivateData();
+      if (!privateData?.jwtPrivateKey) {
+        throw new Error("No private data found, cannot sign JWT");
+      }
+      const token = sign(
+        { userId: user._id.toString() },
+        privateData.jwtPrivateKey,
+        { expiresIn: getWithDefault("COOKIE_VALIDITY_MS", "1h") as `${number}` },
       );
+      storeTokenInCookie(req, res, token);
     }
-    await storeInUser("_id", user._id, infos);
-    const privateData = await getPrivateData();
-    if (!privateData?.jwtPrivateKey) {
-      throw new Error("No private data found, cannot sign JWT");
-    }
-    const token = sign(
-      { userId: user._id.toString() },
-      privateData.jwtPrivateKey,
-      { expiresIn: getWithDefault("COOKIE_VALIDITY_MS", "1h") as `${number}` },
-    );
-    storeTokenInCookie(req, res, token);
   } catch (e) {
     logger.error(e);
     if (e instanceof HttpError && e.status === 429) {
       const retryAfterSeconds = Math.ceil((e.retryAfterMs ?? 0) / 1000);
-      return res.redirect(
-        `${get("CLIENT_ENDPOINT")}/login?error=spotify_rate_limited&retryAfter=${retryAfterSeconds}`,
-      );
+      redirectUrl = `${get("CLIENT_ENDPOINT")}/login?error=spotify_rate_limited&retryAfter=${retryAfterSeconds}`;
+    } else {
+      redirectUrl = `${get("CLIENT_ENDPOINT")}/login?error=spotify_auth_failed`;
     }
-    return res.redirect(
-      `${get("CLIENT_ENDPOINT")}/login?error=spotify_auth_failed`,
-    );
   } finally {
     res.clearCookie(OAUTH_COOKIE_NAME);
   }
-  return res.redirect(get("CLIENT_ENDPOINT"));
+  return res.redirect(redirectUrl);
 });
 
 router.get("/spotify/me", logged, withHttpClient, async (req, res) => {
