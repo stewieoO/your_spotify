@@ -10,6 +10,7 @@ import {
 } from "../database";
 import { getPrivateData } from "../database/queries/privateData";
 import { SpotifyMe } from "../tools/apis/spotifyApi";
+import { HttpError } from "../tools/apis/queueHttpClient";
 import { get, getWithDefault } from "../tools/env";
 import { logger } from "../tools/logger";
 import {
@@ -85,6 +86,8 @@ router.get("/spotify/callback", withGlobalPreferences, async (req, res) => {
     const client = spotifyProvider.getHttpClient(infos.accessToken);
     const { data: spotifyMe } = await client.get<SpotifyMe>("/me", {
       priority: "high",
+      bypassRateLimit: true,
+      retry429MaxAttempts: 0,
     });
     let user = await getUserFromField("spotifyId", spotifyMe.id, false);
     if (!user) {
@@ -111,6 +114,15 @@ router.get("/spotify/callback", withGlobalPreferences, async (req, res) => {
     storeTokenInCookie(req, res, token);
   } catch (e) {
     logger.error(e);
+    if (e instanceof HttpError && e.status === 429) {
+      const retryAfterSeconds = Math.ceil((e.retryAfterMs ?? 0) / 1000);
+      return res.redirect(
+        `${get("CLIENT_ENDPOINT")}/login?error=spotify_rate_limited&retryAfter=${retryAfterSeconds}`,
+      );
+    }
+    return res.redirect(
+      `${get("CLIENT_ENDPOINT")}/login?error=spotify_auth_failed`,
+    );
   } finally {
     res.clearCookie(OAUTH_COOKIE_NAME);
   }

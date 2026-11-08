@@ -51,6 +51,8 @@ export class Spotify implements Provider {
           state,
         },
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        priority: "high",
+        bypassRateLimit: true,
       },
     );
 
@@ -72,6 +74,8 @@ export class Spotify implements Provider {
             `${this.clientId}:${this.clientSecret}`,
           ).toString("base64")}`,
         },
+        priority: "high",
+        bypassRateLimit: true,
       },
     );
 

@@ -1,4 +1,5 @@
 import { logger } from "./logger";
+import { HttpError } from "./apis/queueHttpClient";
 
 export const wait = (ms: number) =>
   new Promise((s) => {
@@ -289,6 +290,9 @@ export const retryPromise = async <T>(
       const res = await fn();
       return res;
     } catch (e) {
+      if (e instanceof HttpError && e.status === 429) {
+        throw e;
+      }
       lastError = e;
       logger.error(
         `Retrying crashed promise, ${i + 1}/${max}${

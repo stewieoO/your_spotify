@@ -8,6 +8,7 @@ interface HttpClientRequestConfig {
   headers?: Record<string, string>;
   priority?: RequestPriority;
   retry429MaxAttempts?: number;
+  bypassRateLimit?: boolean;
 }
 
 interface HttpClientResponse<T> {
@@ -27,31 +28,43 @@ interface QueueState {
   highPriorityQueue: QueueItem<any>[];
   normalPriorityQueue: QueueItem<any>[];
   isProcessingQueue: boolean;
+  retryAfterUntil: number;
+  processQueueTimer: ReturnType<typeof setTimeout> | null;
 }
 
 export class HttpError extends Error {
   public readonly status: number;
   public readonly statusText: string;
   public readonly body: string;
+  public readonly retryAfterMs?: number;
 
-  constructor(options: { status: number; statusText: string; body: string }) {
+  constructor(options: {
+    status: number;
+    statusText: string;
+    body: string;
+    retryAfterMs?: number;
+  }) {
     super(
       `HTTP error! status: ${options.status}, statusText: ${options.statusText}, body: ${options.body}`,
     );
     this.status = options.status;
     this.statusText = options.statusText;
     this.body = options.body;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 
-const DEFAULT_RETRY_429_MAX_ATTEMPTS = 5;
+const DEFAULT_RETRY_429_MAX_ATTEMPTS = 1;
 const DEFAULT_RETRY_AFTER_MS = 1000;
+const MAX_TIMEOUT_MS = 2_147_483_647;
 
 function createQueueState(): QueueState {
   return {
     highPriorityQueue: [],
     normalPriorityQueue: [],
     isProcessingQueue: false,
+    retryAfterUntil: 0,
+    processQueueTimer: null,
   };
 }
 
@@ -138,7 +151,20 @@ export class QueuedHttpClient {
       return;
     }
 
-    const next = this.dequeueNext();
+    const bypassRateLimitIndex = this.queueState.highPriorityQueue.findIndex(
+      (item) => item.config.bypassRateLimit,
+    );
+    let next =
+      bypassRateLimitIndex >= 0
+        ? this.queueState.highPriorityQueue.splice(bypassRateLimitIndex, 1)[0]
+        : undefined;
+
+    if (!next && this.queueState.retryAfterUntil > Date.now()) {
+      this.scheduleQueueProcessing();
+      return;
+    }
+
+    next ??= this.dequeueNext();
     if (!next) {
       return;
     }
@@ -175,8 +201,10 @@ export class QueuedHttpClient {
 
     const response = await fetch(url, payload);
 
+    const text = await response.text();
     if (!response.ok) {
-      const text = await response.text();
+      const retryAfterMs =
+        response.status === 429 ? this.parseRetryAfterHeader(response) : undefined;
 
       if (response.status !== 429) {
         throw new HttpError({
@@ -186,25 +214,28 @@ export class QueuedHttpClient {
         });
       }
 
+      this.queueState.retryAfterUntil = Math.max(
+        this.queueState.retryAfterUntil,
+        Date.now() + (retryAfterMs ?? 0),
+      );
+
       const maxAttempts =
         queueItem.config.retry429MaxAttempts ?? DEFAULT_RETRY_429_MAX_ATTEMPTS;
-
       if (queueItem.retry429AttemptCount >= maxAttempts) {
         throw new HttpError({
           status: response.status,
           statusText: response.statusText,
           body: text,
+          retryAfterMs,
         });
       }
 
       queueItem.retry429AttemptCount += 1;
       this.requeue(queueItem);
-
-      const retryAfterMs = this.parseRetryAfterHeader(response);
-      await this.sleep(retryAfterMs);
+      return;
     }
 
-    const data = await response.json();
+    const data = text ? JSON.parse(text) : undefined;
     queueItem.resolve({
       data,
       status: response.status,
@@ -236,6 +267,17 @@ export class QueuedHttpClient {
     );
   }
 
+  private scheduleQueueProcessing() {
+    if (this.queueState.processQueueTimer) {
+      return;
+    }
+    const delay = Math.max(0, this.queueState.retryAfterUntil - Date.now());
+    this.queueState.processQueueTimer = setTimeout(() => {
+      this.queueState.processQueueTimer = null;
+      this.processQueue();
+    }, Math.min(delay, MAX_TIMEOUT_MS));
+  }
+
   private parseRetryAfterHeader(response: Response) {
     const retryAfter = response.headers.get("retry-after");
     if (!retryAfter) {
@@ -259,9 +301,4 @@ export class QueuedHttpClient {
     return Math.max(0, retryAtTimestamp - Date.now());
   }
 
-  private sleep(ms: number) {
-    return new Promise<void>((resolve) => {
-      setTimeout(resolve, ms);
-    });
-  }
 }
